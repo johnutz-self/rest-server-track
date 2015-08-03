@@ -11,7 +11,7 @@ Should compile without errors or warnings.
 
 RUNNING:
 
-In the same terminal window and directory and run 'java -jar target/servertrack-1.0-SNAPSHOT-utzjohnliii.jar'.
+In the same terminal window and directory run 'java -jar target/servertrack-1.0-SNAPSHOT-utzjohnliii.jar'.
 
 NB: '1.0-SNAPSHOT-utzjohnliii' is defined in the project file pom.xml at the root of the directory. feel free to change it.
 
