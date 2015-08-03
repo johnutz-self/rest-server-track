@@ -31,9 +31,18 @@ import javax.xml.bind.annotation.XmlElement;
 import javax.xml.bind.annotation.XmlRootElement;
 
 
+// things required for concurrent scheduling of data insertion tasks
+
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+
 // things required for implementing averaging
 
 import java.util.ArrayDeque;
+import java.lang.Runnable;
 
 
 // things required for collecting and operating on server load data
@@ -41,6 +50,7 @@ import java.util.ArrayDeque;
 import java.util.Map;
 import java.util.Iterator;
 import java.util.concurrent.ConcurrentHashMap;
+
 
 /*
 ASSIGNMENT:
@@ -139,19 +149,28 @@ class StatServerTrack
 }
 
 
-class AvgServerTrack
+class AvgServerTrack implements Runnable
 {
     private final static int iSIZROLL = 100;
     private final static int iSIZHOUR =  60;
     private final static int iSIZDAY  =  24;
 
-    private double dAccLoadCPU = 0;
-    private double dAccLoadRAM = 0;
+    private final ArrayDeque<StatLoad> adqAvgRoll =
+	new ArrayDeque<StatLoad>(iSIZROLL);
+    
+    private final ArrayDeque<StatLoad> adqAvgHour =
+	new ArrayDeque<StatLoad>(iSIZHOUR);
+    
+    private final ArrayDeque<StatLoad> adqAvgDay  =
+	new ArrayDeque<StatLoad>(iSIZDAY);
 
-    private final ArrayDeque<StatLoad> adqAvgRoll = new ArrayDeque<StatLoad>(iSIZROLL);
-    private final ArrayDeque<StatLoad> adqAvgHour = new ArrayDeque<StatLoad>(iSIZHOUR);
-    private final ArrayDeque<StatLoad> adqAvgDay  = new ArrayDeque<StatLoad>(iSIZDAY);
+    private static int        iCntRun = 0;
+    
+    private        double dAccLoadCPU = 0;
+    private        double dAccLoadRAM = 0;
 
+
+    // insert latest submitted stats to update average
     
     void Submit(StatLoad slNew)
     {
@@ -170,6 +189,18 @@ class AvgServerTrack
     }
 
     
+    // 'display' the accumulated Rolling List(s)
+    // TODO: return adqAvgDay list too
+    
+    ArrayDeque<StatLoad> Display()
+    {
+	return adqAvgHour;
+    }
+
+
+    // collect the current average values for cpu and ram load and return as
+    // a StatLoad
+
     StatLoad getAvg()
     {
 	if(adqAvgRoll.isEmpty())
@@ -179,6 +210,57 @@ class AvgServerTrack
 	double dTmpLoadRAM = dAccLoadRAM/(double)adqAvgRoll.size();
 
 	return new StatLoad(dTmpLoadCPU, dTmpLoadRAM);
+    }
+
+
+    // update our running averages 
+  
+    public void run()
+    {	
+	StatLoad sl = getAvg();
+	
+	this.adqAvgRoll.addFirst(sl);
+
+	if(0==iCntRun%iSIZHOUR)
+	    this.adqAvgHour.addFirst(sl);
+
+	if(0==iCntRun%iSIZDAY)
+	    this.adqAvgDay.addFirst(sl);
+
+	iCntRun++;
+    }
+}
+
+// run a runnable repeatedly in a timely fashion and kill it as needed.
+//
+// NB: once it's killed, a new instance would have to be created to
+// 'restart' the runnable
+
+class SchedRunServerTrack
+{
+    private final ScheduledExecutorService ses;
+    private final ScheduledFuture          sf;
+
+    public SchedRunServerTrack(Runnable r, int iInterval, int iCntThrd)
+    {
+	this.ses       = Executors.newScheduledThreadPool(iCntThrd);
+	this.sf        = this.ses.scheduleAtFixedRate(r, 0, iInterval, TimeUnit.SECONDS);
+    }
+
+    public void shutdownRequest()
+    {
+	try
+	{
+	    this.ses.shutdownNow();
+	
+	    if(this.ses.awaitTermination(100,  TimeUnit.MICROSECONDS))
+		return;
+	}
+	// dropping thru since the bailout mechanism would be identical in the catch...
+	catch(InterruptedException e) {}
+	
+	System.out.println("shutdownRequest: failed to shutdown, calling System.exit(0)");
+	System.exit(0); // should we return a particular error code here?
     }
 }
 
