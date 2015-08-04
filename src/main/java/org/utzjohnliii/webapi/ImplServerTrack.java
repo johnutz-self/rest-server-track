@@ -149,6 +149,43 @@ class StatServerTrack
 }
 
 
+// run a runnable repeatedly in a timely fashion and kill it as needed.
+//
+// NB: once it's killed, a new instance would have to be created to
+// 'restart' the runnable
+
+class RunSchedServerTrack
+{
+    private final ScheduledExecutorService ses;
+    private final ScheduledFuture          sf;
+
+    public RunSchedServerTrack(Runnable r, int iInterval, int iCntThrd)
+    {
+	this.ses       = Executors.newScheduledThreadPool(iCntThrd);
+	this.sf        = this.ses.scheduleAtFixedRate(r, 0, iInterval, TimeUnit.SECONDS);
+    }
+
+    public void shutdownRequest()
+    {
+	try
+	{
+	    this.ses.shutdownNow();
+	
+	    if(this.ses.awaitTermination(100,  TimeUnit.MICROSECONDS))
+		return;
+	}
+	// dropping thru since the bailout mechanism would be identical in the catch...
+	catch(InterruptedException e) {}
+	
+	System.out.println("shutdownRequest: failed to shutdown, calling System.exit(0)");
+	System.exit(0); // should we return a particular error code here?
+    }
+}
+
+
+// per server data repository of moving averages, will get inserted into
+// concurrent parent data structure, thus it's sychronization free.
+
 class AvgServerTrack implements Runnable
 {
     private final static int iSIZROLL = 100;
@@ -169,6 +206,7 @@ class AvgServerTrack implements Runnable
     private        double dAccLoadCPU = 0;
     private        double dAccLoadRAM = 0;
 
+    RunSchedServerTrack rsst = new RunSchedServerTrack((Runnable)this, 1, 1);
 
     // insert latest submitted stats to update average
     
@@ -197,7 +235,15 @@ class AvgServerTrack implements Runnable
 	return adqAvgHour;
     }
 
+    
+    // Exists as an incremental debugging step
 
+    StatLoad DisplayOne()
+    {
+	return new StatLoad(dAccLoadCPU, dAccLoadRAM);
+    }
+    
+    
     // collect the current average values for cpu and ram load and return as
     // a StatLoad
 
@@ -231,49 +277,26 @@ class AvgServerTrack implements Runnable
     }
 }
 
-// run a runnable repeatedly in a timely fashion and kill it as needed.
-//
-// NB: once it's killed, a new instance would have to be created to
-// 'restart' the runnable
-
-class SchedRunServerTrack
-{
-    private final ScheduledExecutorService ses;
-    private final ScheduledFuture          sf;
-
-    public SchedRunServerTrack(Runnable r, int iInterval, int iCntThrd)
-    {
-	this.ses       = Executors.newScheduledThreadPool(iCntThrd);
-	this.sf        = this.ses.scheduleAtFixedRate(r, 0, iInterval, TimeUnit.SECONDS);
-    }
-
-    public void shutdownRequest()
-    {
-	try
-	{
-	    this.ses.shutdownNow();
-	
-	    if(this.ses.awaitTermination(100,  TimeUnit.MICROSECONDS))
-		return;
-	}
-	// dropping thru since the bailout mechanism would be identical in the catch...
-	catch(InterruptedException e) {}
-	
-	System.out.println("shutdownRequest: failed to shutdown, calling System.exit(0)");
-	System.exit(0); // should we return a particular error code here?
-    }
-}
-
 
 // ConcurrentHashMap is a good choice when there are high number of updates and
-// not so many reads; does not lock the entire collection for synchronization.
+// not so many reads; does not lock the entire collection for synchronization,
+// it uses lock striping in the region being written to and usually doesnt lock
+// on writes - I am unsure what inspires it to lock on a read, i have yet to
+// find a list of reasons for it to choose that path.
 //
 // The single static instance of this object is what is used to provide thread
 // safe access to the reading and writing of the ServerTrack data.
 //
-// NB: We are choosing to use the default initial size, we will take a
+//
+// NB:
+//
+// We are choosing to use the default initial size, we will take a
 // performance hit at an unknown time if and when the JVM concludes that it
 // needs to grow our map. 
+//
+// Also, the default constructor allocates 16 shards, it can be easily increased
+// if it's shown to be needed.
+//
 //
 // TODO: this currently only supports the storage of 1 data sample per machine,
 // the goal is to replace the stored StatLoad object with an AvgServerTrack
@@ -284,15 +307,27 @@ class StatMapServerTrack
     ConcurrentHashMap chm = new ConcurrentHashMap();
 
 
-    public void insert(StatServerTrack dts)
-    {
-	chm.put(dts.servername, dts.dl);
+    // based on the ConcurrentHashMap implementers decision to *have*
+    // putIfAbsent(), i have to believe that the following 2 lines are the
+    // fastest way to solve the problem of adding new things and writing to new
+    // or existing things - remember, reads are not locked, so the only time
+    // this would lock would be to write the new obj after having discovered
+    // that it doesnt exist.
+
+    public void insert(StatServerTrack sst)
+    {	
+	chm.putIfAbsent(sst.servername, new AvgServerTrack());
+	((AvgServerTrack)chm.get(sst.servername)).Submit(sst.dl);
+	
+	//chm.put(sst.servername, sst.dl);
     }
 
 
     public StatLoad get(String servername)
     {
-	return (StatLoad)chm.get(servername);
+	return ((AvgServerTrack)chm.get(servername)).DisplayOne();
+
+	// return chm.get(servername);
     }
 
 
@@ -313,53 +348,33 @@ class StatMapServerTrack
 }
 
 
+// Endpoint Implementations - Submit and Display
 
 @Path("/servertrack")
+
 public class ImplServerTrack
 {
-    static private StatMapServerTrack smst = new StatMapServerTrack();
+    // NB: this has to be static.
+    //
+    // Figuring this out was a real hairpuller.
+    //
+    // jetty spins up a new class instance for each request. so, absent being
+    // static, the lifetime of the  variable is the lifetime of the request.
+    // Thus the instance that just got loaded by the Submit request goes out of
+    // scope and disappears and the instance that the Display request sees is
+    // brand new and has no data in it. }:-{
     
+    static private StatMapServerTrack smst = new StatMapServerTrack();
+
+
     @Context private Response response;
     @Context private UriInfo   uriInfo;
     
-    @GET
-    @Path("statsdisplay")
-    @Produces(MediaType.TEXT_PLAIN) // MediaType.APPLICATION_XML
-    public String ServerTrackLoadStatsDisplay(@QueryParam("servername") String sName)
-    {
-	if(null==sName)
-	    return "ERROR: NULL severname Parameter";
-	
-	System.out.println("DISPLAY SERVER: " + sName);
-	this.smst.view();
-        StatLoad dl=this.smst.get(sName);
-	
-	if(null==dl)
-	   return "Server not found: " + sName;
-
-	StatServerTrack     dts = new StatServerTrack(sName, dl.loadcpu, dl.loadram);
-
-	StringWriter      swdts = new StringWriter();
-	
-	try
-	{
-	    JAXBContext     jaxbCtx = JAXBContext.newInstance(StatServerTrack.class);
-	    Marshaller      jaxbMar = jaxbCtx.createMarshaller();
-	    
-	    jaxbMar.marshal(dts, swdts);
-	}
-	catch(JAXBException e)
-	{
-	    e.printStackTrace();
-	    return "Server data access error: " + sName;
-	}
-	return swdts.toString(); 
-    }
-
 
     @POST
     @Path("statssubmit")
     @Consumes(MediaType.APPLICATION_XML)
+
     public Response ServerTrackLoadStatsSubmit(String sXMLStatServerTrack)
     {
 	System.out.println("SUBMIT: " +  sXMLStatServerTrack + '\n');
@@ -376,7 +391,7 @@ public class ImplServerTrack
 	    StatServerTrack     dts = (StatServerTrack) jaxbUnm.unmarshal(srdts);
 	    
 	    this.smst.insert(dts);
-	    this.smst.view();
+	    //this.smst.view();
 	}
 	catch(JAXBException e)
 	{
@@ -385,5 +400,41 @@ public class ImplServerTrack
 	}
 	
 	return Response.created(uriInfo.getAbsolutePath()).build();
+    }
+
+    
+    @GET
+    @Path("statsdisplay")
+    @Produces(MediaType.TEXT_PLAIN) // MediaType.APPLICATION_XML
+
+    public String ServerTrackLoadStatsDisplay(@QueryParam("servername") String sName)
+    {
+	if(null==sName)
+	    return "ERROR: NULL severname Parameter";
+	
+	System.out.println("DISPLAY SERVER: " + sName);
+	this.smst.view();
+        StatLoad dl=this.smst.get(sName);
+	
+	if(null==dl)
+	   return "Server not found: " + sName;
+
+	StatServerTrack    dts = new StatServerTrack(sName, dl.loadcpu, dl.loadram);
+
+	StringWriter     swdts = new StringWriter();
+	
+	try
+	{
+	    JAXBContext     jaxbCtx = JAXBContext.newInstance(StatServerTrack.class);
+	    Marshaller      jaxbMar = jaxbCtx.createMarshaller();
+	    
+	    jaxbMar.marshal(dts, swdts);
+	}
+	catch(JAXBException e)
+	{
+	    e.printStackTrace();
+	    return "Server data access error: " + sName;
+	}
+	return swdts.toString(); 
     }
 }
